@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f6f6f4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17171a" media="(prefers-color-scheme: dark)" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon-192.png" type="image/png" />
+    <title>HISAKO</title>
+    <!--
+      ホーム画面用の外枠。
+      GAS の画面は manifest を持てないので、Android の Chrome はアプリとして
+      インストールしてくれない（ホーム画面に追加してもタブで開く）。
+      この外枠が manifest を持ち、中にアプリを埋め込む。
+      アプリ側は config の pwa_origin にこの場所が入っているときだけ埋め込みを許す。
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #f6f6f4;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        html,
+        body {
+          background: #17171a;
+        }
+      }
+
+      iframe {
+        display: block;
+        border: 0;
+        width: 100%;
+        height: 100dvh;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="app" title="HISAKO" allow="autoplay; microphone; clipboard-write"></iframe>
+    <script>
+      var EXEC =
+        'https://script.google.com/macros/s/AKfycbwOTTSAfml1jAP3eghVRqn6X2m3jB6s3XV8sT3Pk64Te0lfduI6eoYzZ-U3rttTZ7id/exec';
+      // ?view=vrm や ?flow=runToday は、そのまま中のアプリへ渡す
+      document.getElementById('app').src = EXEC + location.search;
+
+      if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+    </script>
+  </body>
+</html>
