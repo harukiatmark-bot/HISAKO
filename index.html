@@ -19,6 +19,9 @@
       インストールしてくれない（ホーム画面に追加してもタブで開く）。
       この外枠が manifest を持ち、中にアプリを埋め込む。
       アプリ側は config の pwa_origin にこの場所が入っているときだけ埋め込みを許す。
+
+      通知（Web Push）もここが受け持つ。購読はオリジンごとなので、
+      script.google.com の中のアプリでは受け取れない。
     -->
     <style>
       html,
@@ -35,17 +38,235 @@
         width: 100%;
         height: 100dvh;
       }
+
+      /* 通知の許可を求める札。アプリの設定から頼まれたときだけ出す。
+         ブラウザは「指で押した直後」でないと許可を聞いてくれないので、
+         iframe の中のボタンでは足りず、ここに 1 枚出す必要がある。 */
+      #ask {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: rgba(0, 0, 0, 0.72);
+        -webkit-backdrop-filter: blur(6px);
+        backdrop-filter: blur(6px);
+        font-family: system-ui, sans-serif;
+        color: #fff;
+      }
+
+      #ask.on {
+        display: flex;
+      }
+
+      #ask div {
+        max-width: 320px;
+        text-align: center;
+        line-height: 1.7;
+        font-size: 14px;
+      }
+
+      #ask button {
+        font: inherit;
+        margin-top: 16px;
+        padding: 10px 20px;
+        border-radius: 999px;
+        border: 0;
+        background: #fff;
+        color: #17171a;
+        cursor: pointer;
+      }
+
+      #ask button.quiet {
+        margin-left: 8px;
+        background: transparent;
+        color: #fff;
+        border: 1px solid rgba(255, 255, 255, 0.4);
+      }
     </style>
   </head>
   <body>
     <iframe id="app" title="HISAKO" allow="autoplay; microphone; clipboard-write"></iframe>
+
+    <div id="ask" role="dialog" aria-label="通知の許可">
+      <div>
+        <p id="ask-text">HISAKO から通知を受け取れるようにします。</p>
+        <button id="ask-yes" type="button">許可する</button>
+        <button id="ask-no" type="button" class="quiet">やめる</button>
+      </div>
+    </div>
+
     <script>
       var EXEC =
         'https://script.google.com/macros/s/AKfycbwOTTSAfml1jAP3eghVRqn6X2m3jB6s3XV8sT3Pk64Te0lfduI6eoYzZ-U3rttTZ7id/exec';
-      // ?view=vrm や ?flow=runToday は、そのまま中のアプリへ渡す
-      document.getElementById('app').src = EXEC + location.search;
+      // 通知の公開鍵。公開前提の鍵なのでここに書いてよい（秘密鍵は中継の Secret）
+      var VAPID_PUBLIC = 'BDpriCxF3jpEQ7LsSQl1kHN8QwJxWu7_72SBzUFYhXA7BhkL4VbedHtPFK-2GxyCLAfhN9DZ4BpvROWbWuwWGpc';
 
-      if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+      var frame = document.getElementById('app');
+      // ?view=vrm や ?flow=runToday は、そのまま中のアプリへ渡す
+      frame.src = EXEC + location.search;
+
+      var ready = null;
+      if ('serviceWorker' in navigator) ready = navigator.serviceWorker.register('sw.js');
+
+      /* ---- 中のアプリとのやりとり ----
+       *
+       * アプリ本体は script.google.com の中の、さらに googleusercontent.com の枠で動く。
+       * なので送り先は「聞いてきた窓そのもの」に返す（event.source / event.origin）。
+       */
+
+      var appWindow = null;
+      var appOrigin = null;
+
+      function fromApp(origin) {
+        return origin === 'https://script.google.com' || /^https:\/\/[a-z0-9-]+\.googleusercontent\.com$/.test(origin);
+      }
+
+      function toApp(message) {
+        if (!appWindow || !appOrigin) return;
+        try {
+          appWindow.postMessage(message, appOrigin);
+        } catch (error) {
+          // 閉じたあとなど。次のやりとりで繋ぎ直る
+        }
+      }
+
+      function b64url(buffer) {
+        var bytes = new Uint8Array(buffer);
+        var raw = '';
+        for (var i = 0; i < bytes.length; i++) raw += String.fromCharCode(bytes[i]);
+        return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      }
+
+      function keyBytes(value) {
+        var text = value.replace(/-/g, '+').replace(/_/g, '/');
+        var padded = text + '='.repeat((4 - (text.length % 4)) % 4);
+        var raw = atob(padded);
+        var out = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+        return out;
+      }
+
+      function shape(subscription) {
+        if (!subscription) return null;
+        var json = subscription.toJSON();
+        return {
+          endpoint: json.endpoint,
+          p256dh: (json.keys && json.keys.p256dh) || '',
+          auth: (json.keys && json.keys.auth) || '',
+        };
+      }
+
+      /** 今の状態をアプリへ返す */
+      function sendStatus() {
+        if (!ready || !('PushManager' in window) || !('Notification' in window)) {
+          toApp({ hisako: 'push-status', state: 'unsupported' });
+          return;
+        }
+        ready
+          .then(function (registration) {
+            return registration.pushManager.getSubscription();
+          })
+          .then(function (subscription) {
+            toApp({
+              hisako: 'push-status',
+              state: Notification.permission,
+              subscription: shape(subscription),
+            });
+          })
+          .catch(function () {
+            toApp({ hisako: 'push-status', state: 'unsupported' });
+          });
+      }
+
+      function subscribe() {
+        return ready
+          .then(function (registration) {
+            return registration.pushManager.subscribe({
+              // 受け取ったら必ず通知を出す約束。Chrome はこれを求める
+              userVisibleOnly: true,
+              applicationServerKey: keyBytes(VAPID_PUBLIC),
+            });
+          })
+          .then(function (subscription) {
+            toApp({ hisako: 'push-subscribed', subscription: shape(subscription) });
+          })
+          .catch(function (error) {
+            toApp({ hisako: 'push-failed', reason: String(error && error.message ? error.message : error) });
+          });
+      }
+
+      function unsubscribe() {
+        if (!ready) return;
+        ready
+          .then(function (registration) {
+            return registration.pushManager.getSubscription();
+          })
+          .then(function (subscription) {
+            var endpoint = subscription ? subscription.endpoint : '';
+            return (subscription ? subscription.unsubscribe() : Promise.resolve(true)).then(function () {
+              toApp({ hisako: 'push-unsubscribed', endpoint: endpoint });
+            });
+          })
+          .catch(function () {
+            toApp({ hisako: 'push-unsubscribed', endpoint: '' });
+          });
+      }
+
+      var ask = document.getElementById('ask');
+
+      function askPermission() {
+        if (!ready || !('Notification' in window) || !('PushManager' in window)) {
+          toApp({ hisako: 'push-failed', reason: 'この端末では通知を使えません' });
+          return;
+        }
+        if (Notification.permission === 'denied') {
+          toApp({ hisako: 'push-failed', reason: 'ブラウザの設定で通知が拒否されています' });
+          return;
+        }
+        if (Notification.permission === 'granted') {
+          subscribe();
+          return;
+        }
+        // 許可は「押した直後」でないと聞けない。札を出して、そこで押してもらう
+        ask.classList.add('on');
+      }
+
+      document.getElementById('ask-yes').addEventListener('click', function () {
+        ask.classList.remove('on');
+        Notification.requestPermission().then(function (result) {
+          if (result === 'granted') subscribe();
+          else toApp({ hisako: 'push-failed', reason: '許可されませんでした' });
+        });
+      });
+
+      document.getElementById('ask-no').addEventListener('click', function () {
+        ask.classList.remove('on');
+        toApp({ hisako: 'push-failed', reason: 'やめました' });
+      });
+
+      window.addEventListener('message', function (event) {
+        if (!fromApp(event.origin)) return;
+        var data = event.data;
+        if (!data || typeof data !== 'object') return;
+        appWindow = event.source;
+        appOrigin = event.origin;
+        if (data.hisako === 'push-status') sendStatus();
+        else if (data.hisako === 'push-subscribe') askPermission();
+        else if (data.hisako === 'push-unsubscribe') unsubscribe();
+      });
+
+      // 通知を押して戻ってきたとき、Service Worker が行き先を教えてくる
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.addEventListener('message', function (event) {
+          var data = event.data;
+          if (!data || data.hisako !== 'open' || !data.url) return;
+          var query = String(data.url).split('?')[1] || '';
+          frame.src = EXEC + (query ? '?' + query : '');
+        });
+      }
     </script>
   </body>
 </html>
